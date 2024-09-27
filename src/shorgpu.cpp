@@ -57,6 +57,9 @@ int main(int argc,
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
+
+    int r = ceil(sqrt(mpi_size));
+
     global_qubits = std::log2(mpi_size);
     if (mpi_size != (1 << global_qubits) || global_qubits < 1 || global_qubits > 31)
         return error("mpi_size = "+std::to_string(mpi_size)+" must be >= 2 and a power of 2 (global_qubits = "+std::to_string(global_qubits)+": need at least 1 and not more than 31 global qubits)", true);
@@ -374,14 +377,20 @@ int main(int argc,
                 time_it(time_oraclearrange);
 
                 // MPI transfer psi from this GPU -> psibuf from other GPUs (post recvs first, and take care of well-ordered sends; this version was faster than MPI_Alltoallv)
-#ifdef ALLTOALL
+//#ifdef ALLTOALL
                 #pragma acc host_data use_device(psi)
-                MPI_Alltoallv(psi, oracle_countsend, oracle_offsetsend, MPI_C_DOUBLE_COMPLEX,
-                              psibuf, oracle_countrecv, oracle_offsetrecv, MPI_C_DOUBLE_COMPLEX,
-                              mpi_xcomm);
-                MPI_Alltoallv(oracle_idxsend, oracle_countsend, oracle_offsetsend, MPI_INT,
-                              oracle_idxrecv, oracle_countrecv, oracle_offsetrecv, MPI_INT,
-                              mpi_xcomm);
+//                MPI_Alltoallv(psi, oracle_countsend, oracle_offsetsend, MPI_C_DOUBLE_COMPLEX,
+//                              psibuf, oracle_countrecv, oracle_offsetrecv, MPI_C_DOUBLE_COMPLEX,
+//                              mpi_xcomm);
+                twophase_rbruck_alltoallv(r, (char*)psi, oracle_countsend, oracle_offsetsend, MPI_C_DOUBLE_COMPLEX,
+                		(char*)psibuf, oracle_countrecv, oracle_offsetrecv, MPI_C_DOUBLE_COMPLEX,
+                        mpi_xcomm)
+//                MPI_Alltoallv(oracle_idxsend, oracle_countsend, oracle_offsetsend, MPI_INT,
+//                              oracle_idxrecv, oracle_countrecv, oracle_offsetrecv, MPI_INT,
+//                              mpi_xcomm);
+                twophase_rbruck_alltoallv(r, (char*)oracle_idxsend, oracle_countsend, oracle_offsetsend, MPI_INT,
+                		(char*)oracle_idxrecv, oracle_countrecv, oracle_offsetrecv, MPI_INT,
+                        mpi_xcomm);
 #else
                 int num_requests = 0;
                 for (int delta_xrank = 0; delta_xrank < mpi_xsize; ++delta_xrank) {
