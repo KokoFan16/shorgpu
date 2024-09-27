@@ -384,7 +384,7 @@ int main(int argc,
 //                              mpi_xcomm);
                 twophase_rbruck_alltoallv(r, (char*)psi, oracle_countsend, oracle_offsetsend, MPI_C_DOUBLE_COMPLEX,
                 		(char*)psibuf, oracle_countrecv, oracle_offsetrecv, MPI_C_DOUBLE_COMPLEX,
-                        mpi_xcomm)
+                        mpi_xcomm);
 //                MPI_Alltoallv(oracle_idxsend, oracle_countsend, oracle_offsetsend, MPI_INT,
 //                              oracle_idxrecv, oracle_countrecv, oracle_offsetrecv, MPI_INT,
 //                              mpi_xcomm);
