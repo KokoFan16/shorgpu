@@ -377,7 +377,7 @@ int main(int argc,
                 time_it(time_oraclearrange);
 
                 // MPI transfer psi from this GPU -> psibuf from other GPUs (post recvs first, and take care of well-ordered sends; this version was faster than MPI_Alltoallv)
-//#ifdef ALLTOALL
+#ifdef ALLTOALL
                 #pragma acc host_data use_device(psi)
 //                MPI_Alltoallv(psi, oracle_countsend, oracle_offsetsend, MPI_C_DOUBLE_COMPLEX,
 //                              psibuf, oracle_countrecv, oracle_offsetrecv, MPI_C_DOUBLE_COMPLEX,
