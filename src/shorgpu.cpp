@@ -731,7 +731,7 @@ int twophase_rbruck_alltoallv(int r, char *sendbuf, int *sendcounts, int *sdispl
 
 	MPI_Type_size(sendtype, &typesize);
 
-	w = ceil(log(nprocs) / float(log(r))); // calculate the number of digits when using r-representation
+	w = ceil(log(nprocs) / log(r)); // calculate the number of digits when using r-representation
 	nlpow = myPow(r, w-1); // maximum send number of elements
 	d = (myPow(r, w) - nprocs) / nlpow; // calculate the number of highest digits
 
@@ -743,6 +743,7 @@ int twophase_rbruck_alltoallv(int r, char *sendbuf, int *sendcounts, int *sdispl
 	MPI_Allreduce(&local_max_count, &max_send_count, 1, MPI_INT, MPI_MAX, comm);
 	memcpy(sendNcopy, sendcounts, nprocs*sizeof(int));
 
+
     // 2. create local index array after rotation
 	for (int i = 0; i < nprocs; i++)
 		rotate_index_array[i] = (2*rank-i+nprocs)%nprocs;
@@ -752,7 +753,6 @@ int twophase_rbruck_alltoallv(int r, char *sendbuf, int *sendcounts, int *sdispl
 	char* temp_send_buffer = (char*) malloc(max_send_count*typesize*nlpow);
 	char* temp_recv_buffer = (char*) malloc(max_send_count*typesize*nlpow);
 	memset(pos_status, 0, nprocs*sizeof(int));
-	memcpy(&recvbuf[rdispls[rank]*typesize], &sendbuf[sdispls[rank]*typesize], recvcounts[rank]*typesize);
 
 	int sent_blocks[nlpow];
 	int di = 0, spoint = 1, distance = myPow(r, w-1), next_distance = distance*r;
@@ -817,6 +817,8 @@ int twophase_rbruck_alltoallv(int r, char *sendbuf, int *sendcounts, int *sdispl
 		distance /= r;
 		next_distance /= r;
 	}
+
+	memcpy(&recvbuf[rdispls[rank]*typesize], &sendbuf[sdispls[rank]*typesize], recvcounts[rank]*typesize);
 
 	free(temp_send_buffer);
 	free(temp_recv_buffer);
