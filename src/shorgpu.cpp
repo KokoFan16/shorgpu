@@ -11,14 +11,17 @@
 #include <chrono>
 #include <bitset>
 #include <algorithm>
+#include <thread>
 #include <cmath>
 #include <ctime>
 #include <cstdlib>
 #include <openacc.h>
 #include <cuda_runtime.h>
 #include <cuComplex.h>
+#include <nccl.h>
 #include <mpi.h>
 #include <omp.h>
+#include <sched.h>
 
 using namespace std::string_literals;
 
@@ -34,7 +37,15 @@ uint64_t global_qubits = 0;
 uint64_t local_qubits = 0;
 cuDoubleComplex* psi = nullptr;
 
+enum communication_type : int {
+    communication_irecvisend,
+    communication_alltoall,
+    communication_nccl
+};
+
 std::string uuidstr(const char uuid[16]);
+communication_type parse_communication(std::string argument);
+std::string print_communication(communication_type communication);
 int error(std::string message,
           bool onlyrank0 = false);
 uint64_t modular_inverse(uint64_t a,
@@ -45,9 +56,6 @@ uint64_t modular_multiply(uint64_t a,
 double compute_norm();
 void dump_psi(bool includezeros = true, const std::string title = "");
 
-int twophase_rbruck_alltoallv(int r, char *sendbuf, int *sendcounts, int *sdispls, MPI_Datatype sendtype,
-		char *recvbuf, int *recvcounts, int *rdispls, MPI_Datatype recvtype, MPI_Comm comm);
-
 int main(int argc,
          char* argv[]) {
     using std::min;
@@ -57,9 +65,6 @@ int main(int argc,
     MPI_Init(&argc, &argv);
     MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
     MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
-
-    int r = ceil(sqrt(mpi_size));
-
     global_qubits = std::log2(mpi_size);
     if (mpi_size != (1 << global_qubits) || global_qubits < 1 || global_qubits > 31)
         return error("mpi_size = "+std::to_string(mpi_size)+" must be >= 2 and a power of 2 (global_qubits = "+std::to_string(global_qubits)+": need at least 1 and not more than 31 global qubits)", true);
@@ -70,18 +75,33 @@ int main(int argc,
     MPI_Comm_size(mpi_xcomm, &mpi_xsize);
     if (mpi_rank != mpi_x*mpi_xsize + mpi_xrank)
         return error("mpi_rank != mpi_x*mpi_xsize + mpi_xrank (mpi_rank,mpi_size,mpi_xrank,mpi_xsize="+std::to_string(mpi_rank)+','+std::to_string(mpi_size)+','+std::to_string(mpi_xrank)+','+std::to_string(mpi_xsize)+')');
+
+    // initialize nvidia devices
+    int num_nvidia_devices = acc_get_num_devices(acc_device_nvidia);
     int mpi_local_rank = -1;
-    MPI_Comm mpi_local_comm;
-    MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, mpi_rank, MPI_INFO_NULL, &mpi_local_comm);
-    MPI_Comm_rank(mpi_local_comm, &mpi_local_rank);
-    MPI_Comm_free(&mpi_local_comm);
-    if (acc_get_num_devices(acc_device_nvidia) != 0)
-        acc_set_device_num(mpi_local_rank%acc_get_num_devices(acc_device_nvidia), acc_device_nvidia);
+    int mpi_local_size = -1;
+    {
+        MPI_Comm mpi_local_comm;
+        MPI_Comm_split_type(MPI_COMM_WORLD, MPI_COMM_TYPE_SHARED, mpi_rank, MPI_INFO_NULL, &mpi_local_comm);
+        MPI_Comm_rank(mpi_local_comm, &mpi_local_rank);
+        MPI_Comm_size(mpi_local_comm, &mpi_local_size);
+        MPI_Comm_free(&mpi_local_comm);
+    }
+    if (num_nvidia_devices != 0) {
+        if (num_nvidia_devices == 1)  // only one device visible, assume GPU affinity is handled via CUDA_VISIBLE_DEVICES
+            acc_set_device_num(0, acc_device_nvidia);
+        else if (num_nvidia_devices >= mpi_local_size)
+            acc_set_device_num(mpi_local_rank, acc_device_nvidia);
+        else
+            return error("We're supposed to handle device affinity ourselves but the number of visible nvidia devices ("s+std::to_string(num_nvidia_devices)+") is less than number of ranks on the node ("+std::to_string(mpi_local_size)+")");
+    }
     #pragma acc init
+    cudaStream_t cuda_stream {};
+    cudaStreamCreate(&cuda_stream);
 
     // parse arguments
     if (argc < 4)
-        error("Usage: "s+argv[0]+" N a t [repeat=1] [seed=-1] [errorseed=-1] [append=1] [cpprandom=1] [saverandom=0] [buffercount=2**21] [delta=0] [quantumerrors=0] [bandwidth=-1] [outfile=classicalbits.out]", true);
+        error("Usage: "s+argv[0]+" N a t [repeat=1] [seed=-1] [errorseed=-1] [append=1] [cpprandom=1] [saverandom=0] [buffercount=2**21] [delta=0] [quantumerrors=0] [bandwidth=-1] [outfile=classicalbits.out] [communication=nccl]", true);
     uint64_t N = std::stoull(argv[1]);
     uint64_t a = std::stoull(argv[2]);
     uint64_t t = std::stoull(argv[3]);
@@ -99,7 +119,7 @@ int main(int argc,
     num_local = 1L << local_qubits;
     if (global_qubits >= num_qubits)
         return error("Too many global qubits: need at least 1 local qubit (num_qubits,global_qubits="+std::to_string(num_qubits)+','+std::to_string(global_qubits)+')', true);
-    if (local_qubits < 1 || local_qubits >= 32)  // we shouldn't have more than 30 local qubits = 16 GiB on each GPU anyway
+    if (local_qubits < 1 || local_qubits >= 32)  // using 32 local qubits would require (2*16 + 2*4)*2^32 B = 160 GiB per GPU which we don't have anyway at the moment, so no need to upgrade to uint64_t for local addressing (NOTE: NCCL might not suffer from this problem since it uses size_t for count (and not int like MPI!) but still oraclecount might be in danger, see warning below)
         return error("Too many or zero local qubits: For more than 32 local qubits, modular multiplication and addressing in MPI send and recv will overflow (num_qubits,global_qubits="+std::to_string(num_qubits)+','+std::to_string(global_qubits)+')', true);
     uint64_t repeat = 1;
     int64_t seed = -1;
@@ -107,11 +127,17 @@ int main(int argc,
     bool append = true;
     bool cpprandom = true;
     bool saverandom = false;
-    uint64_t buffercount = 1 << 21;  // see optimize-buffercount.png
+    uint64_t buffercount = 1 << 21;  // buffercount is only required if NCCL is not used (for default value see optimize-buffercount.png)
     double delta = 0;
-    int quantumerrors = 0;  // 0 -> classical errors, 1 -> quantum (measurement) error (see paper), 2 -> quantum amplitude initialization error (63.19), 3 -> quantum phase initialization error (63.19), TODO: 4 -> gate error with Gaussian noise on rotation gates,  any other value -> no error at all even if delta != 0
+    int quantumerrors = 0;  // 0 -> classical errors,
+                            // 1 -> quantum (measurement) error (see paper)
+                            // 2 -> quantum amplitude initialization error (63.19)
+                            // 3 -> quantum phase initialization error (63.19)
+                            // 4 -> gate error with Gaussian noise on rotation gates (63.26, as in Cai2023)
+                            // any other value -> no error at all even if delta != 0
     int bandwidth = -1;  // to implement Coppersmith's banded version of the QFT (cut off all rotations with angle < pi/2^bandwidth , see 63.20); NOTE: bandwidth = m_Coppersmith = dmax_Fowler = bandwidth_Nam = bandparameter_Cai - 2
     std::string outfile = "classicalbits.out";
+    communication_type communication = communication_nccl;
     bool debug = false;      // undocumented, a lot of output, only do this for small systems (initializes each amplitude to a unique number and dumps the state after the oracle gate to debug the mpi permutation)
     bool debugshor = false;  // undocumented, a lot of output, only do this for small systems (dumps the state after each operation)
     for (int i = 4; i < argc; ++i) {
@@ -128,33 +154,84 @@ int main(int argc,
         else if (arg.substr(0,pos) == "quantumerrors") quantumerrors = std::stoi(arg.substr(pos+1));
         else if (arg.substr(0,pos) == "bandwidth")     bandwidth = std::stoi(arg.substr(pos+1));
         else if (arg.substr(0,pos) == "outfile")       outfile = arg.substr(pos+1);
+        else if (arg.substr(0,pos) == "communication") communication = parse_communication(arg.substr(pos+1));
         else if (arg.substr(0,pos) == "debug")         debug = std::stol(arg.substr(pos+1));
         else if (arg.substr(0,pos) == "debugshor")     debugshor = std::stol(arg.substr(pos+1));
-        else error("Unknown parameter: "+arg, true);
+        else return error("Unknown parameter: "+arg, true);
     }
     if (bandwidth == -1)
         bandwidth = t-1;  // in this case we do the full QFT
 
-    // boundary checks on buffercount, MPI message tags, and number of requests
-    if (mpi_rank == 0 && num_local/buffercount >= 16384)
-        std::cout << "[WARN] buffercount=" << buffercount << " may be too small, look out for an MPI crash (num_local/buffercount=" << num_local/buffercount << " > 16384)" << std::endl;
-    if (mpi_rank == 0 && buffercount*sizeof(cuDoubleComplex) >= INT_MAX)
-        std::cout << "[WARN] buffercount=" << buffercount << " may be too large, look out for an MPI crash (buffercount*sizeof(cuDoubleComplex)=" << buffercount*sizeof(cuDoubleComplex) << " > INT_MAX=" << INT_MAX << ')' << std::endl;
-    int mpi_flag = 0;
-    int mpi_tag_ub = 0;
-    MPI_Comm_get_attr(MPI_COMM_WORLD, MPI_TAG_UB, &mpi_tag_ub, &mpi_flag);
-    if (uint64_t(mpi_tag_ub) < 2*(num_local-1)/buffercount+1)
-        return error("buffercount="+std::to_string(buffercount)+" is too small: need message tags up to "+std::to_string(2*(num_local-1)/buffercount+1)+" but mpi_tag_ub is only "+std::to_string(mpi_tag_ub), true);
-    const uint64_t mpi_max_requests = 4ULL*mpi_xsize*max<uint64_t>(num_local/buffercount,1);
-    if(mpi_max_requests > INT_MAX)  // if this fails, we could alternatively do MPI_Waitall before it overflows... but so many messages should never be sent anyway
-        return error("buffercount="+std::to_string(buffercount)+" is too small: would need "+std::to_string(mpi_max_requests)+" > INT_MAX="+std::to_string(INT_MAX)+" message requests", true);
-    MPI_Request* mpi_requests = new MPI_Request[mpi_x*mpi_max_requests];
+    // determine the number of unique GPUs used in this computation by collecting their UUIDs
+    int cudadev = acc_get_device_num(acc_get_device_type());
+    cudaDeviceProp deviceprop;
+    cudaGetDeviceProperties(&deviceprop, cudadev);
+    std::set<std::string> gpus;
+    int num_gpus = 0;
+    if (mpi_rank != 0) {
+        MPI_Send(deviceprop.uuid.bytes, 16, MPI_CHAR, 0, 0, MPI_COMM_WORLD);
+    } else {
+        gpus.insert(uuidstr(deviceprop.uuid.bytes));
+        for (int i = 1; i < mpi_size; ++i) {
+            char uuid[16] {};
+            MPI_Recv(uuid, 16, MPI_CHAR, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+            gpus.insert(uuidstr(uuid));
+        }
+        num_gpus = gpus.size();
+    }
+    MPI_Bcast(&num_gpus, 1, MPI_INT, 0, MPI_COMM_WORLD);
 
-    // generate the random numbers used for the sampling in the measurement, and for quantumerrors=0,1 (must be used only by mpi_rank == mpi_xsize <=> mpi_x == 1 && mpi_xrank == 0 <=> |10...0***>, so use .at() for access)
-    std::vector<double> random, random2;
+    // initialize NCCL
+    int nccl_version = 0;
+    ncclGetVersion(&nccl_version);
+    ncclUniqueId nccl_id {};
+    ncclComm_t nccl_comm {}, nccl_xcomm {};
+    if (communication == communication_nccl) {
+        if (mpi_size > num_gpus) {
+            communication = communication_irecvisend;  // disable NCCL in case of oversubscription
+            if (mpi_rank == 0)
+                std::cout << "[WARN] NCCL does not support oversubscription with " << mpi_size << " processes and only " << num_gpus << " GPUs; falling back to only MPI for communication" << std::endl;
+        } else {
+            if (mpi_rank == 0)
+                ncclGetUniqueId(&nccl_id);
+            MPI_Bcast(&nccl_id, sizeof(nccl_id), MPI_BYTE, 0, MPI_COMM_WORLD);
+            MPI_Barrier(MPI_COMM_WORLD);
+            ncclCommInitRank(&nccl_comm, mpi_size, nccl_id, mpi_rank);
+            ncclCommSplit(nccl_comm, mpi_x, mpi_rank, &nccl_xcomm, nullptr);
+        }
+    }
+
+    // boundary checks on buffercount, MPI message tags, and number of requests (some are only required if we don't use NCCL for high-performance communication)
+    MPI_Request* mpi_requests = nullptr;
+    if (communication == communication_nccl) {
+        if (mpi_rank == 0 && local_qubits >= 31)  // 31 local qubits requires (2*16 + 2*4)*2^31 B = 80 GiB per GPU; watch out on the H100 (do we have to reintroduce buffercount to NCCL to fix that? or upgrade the oraclecount buffers to size_t?)
+            std::cout << "[WARN] local_qubits=" << local_qubits << " may be too large for oraclecount buffers, especially with NCCL we need 2*count_as_int since there is no ncclDoubleComplex type" << std::endl;
+    } else {
+        if (mpi_rank == 0 && num_local/buffercount >= 16384)
+            std::cout << "[WARN] buffercount=" << buffercount << " may be too small, look out for an MPI crash (num_local/buffercount=" << num_local/buffercount << " >= 16384)" << std::endl;
+        if (mpi_rank == 0 && sizeof(cuDoubleComplex)*buffercount >= INT_MAX)
+            std::cout << "[WARN] buffercount=" << buffercount << " may be too large, look out for an MPI crash (buffercount*sizeof(cuDoubleComplex)=" << sizeof(cuDoubleComplex)*buffercount << " >= INT_MAX=" << INT_MAX << ')' << std::endl;
+        if (communication == communication_irecvisend) {
+            int mpi_flag = 0;
+            int mpi_tag_ub = 0;
+            MPI_Comm_get_attr(MPI_COMM_WORLD, MPI_TAG_UB, &mpi_tag_ub, &mpi_flag);
+            if (uint64_t(mpi_tag_ub) < 2*(num_local-1)/buffercount+1)
+                return error("buffercount="+std::to_string(buffercount)+" is too small: need message tags up to "+std::to_string(2*(num_local-1)/buffercount+1)+" but mpi_tag_ub is only "+std::to_string(mpi_tag_ub), true);
+            const uint64_t mpi_max_requests = 4ULL*mpi_xsize*max<uint64_t>(num_local/buffercount,1);
+            if(mpi_max_requests > INT_MAX)  // if this fails, we could alternatively do MPI_Waitall before it overflows... but so many messages should never be sent anyway
+                return error("buffercount="+std::to_string(buffercount)+" is too small: would need "+std::to_string(mpi_max_requests)+" > INT_MAX="+std::to_string(INT_MAX)+" message requests", true);
+            mpi_requests = new MPI_Request[mpi_x*mpi_max_requests];
+        }
+    }
+
+    // generate the random numbers used for the sampling in the measurement and for quantumerrors=0,1,4 (random and random2 must only be used only mpi_rank == mpi_xsize <=> mpi_x == 1 && mpi_xrank == 0 <=> |j> = |10...0***>, so use .at() for access; randomN is broadcasted to all mpi_x=1 ranks that need to use it)
+    std::vector<double> random, random2, randomN;
+    size_t rNidx = 0;
     if (mpi_rank == mpi_xsize) {
         random.resize(repeat*t);
         random2.resize(repeat*t);
+        if (quantumerrors == 4)
+            randomN.resize(repeat*t*(t-1)/2);  // (63.26)
         if (cpprandom) {
             std::random_device seeder;
             if (seed < 0)
@@ -162,11 +239,14 @@ int main(int argc,
             if (errorseed < 0)
                 errorseed = seeder();
             std::default_random_engine generator(seed), errorgenerator(errorseed);
-            std::uniform_real_distribution<double> distribution(0.0, 1.0);  // r is drawn from [0.0, 1.0)
+            std::uniform_real_distribution<double> uniform(0.0, 1.0);  // r is drawn from [0.0, 1.0)
+            std::normal_distribution<double> normal(0.0, 1.0);  // r is drawn from N(0,1)
             for (auto& r : random)
-                r = distribution(generator);
+                r = uniform(generator);
             for (auto& r : random2)
-                r = distribution(errorgenerator);
+                r = uniform(errorgenerator);
+            for (auto& r : randomN)
+                r = normal(errorgenerator);
         } else {
             if (seed < 0)
                 seed = std::time(nullptr);
@@ -178,6 +258,11 @@ int main(int argc,
             std::srand(errorseed);
             for (auto& r : random2)
                 r = 1.*std::rand() / RAND_MAX;
+            for (auto& r : randomN) {
+                double u = 1.*std::rand() / RAND_MAX;
+                double v = 1.*std::rand() / RAND_MAX;
+                r = std::sqrt(-2*std::log(u))*std::cos(2*pi*v);  // using both Box-Muller numbers or even the Marsaglia polar method is not necessary here
+            }
         }
         if (saverandom) {
             std::ofstream random_file("randomnumbers.out", append ? std::ios::app : std::ios::out);
@@ -186,26 +271,21 @@ int main(int argc,
                 random_file << r << std::endl;
             for (auto r : random2)
                 random_file << r << std::endl;
+            if (quantumerrors == 4) {
+                random_file << std::endl;
+                for (auto r : randomN)
+                    random_file << r << std::endl;
+            }
         }
     }
     MPI_Bcast(&seed, 1, MPI_INT64_T, mpi_xsize, MPI_COMM_WORLD);  // mpi_rank = mpi_xsize will do the sampling but mpi_rank = 0 will print the seeds
     MPI_Bcast(&errorseed, 1, MPI_INT64_T, mpi_xsize, MPI_COMM_WORLD);
-
-    // determine the number of unique GPUs used in this computation by collecting their UUIDs
-    int cudadev = acc_get_device_num(acc_get_device_type());
-    cudaDeviceProp deviceprop;
-    cudaGetDeviceProperties(&deviceprop, cudadev);
-    std::set<std::string> gpus;
-    if (mpi_rank != 0) {
-        MPI_Send(deviceprop.uuid.bytes, 16, MPI_CHAR, 0, 0, MPI_COMM_WORLD);
-    } else {
-        gpus.insert(uuidstr(deviceprop.uuid.bytes));
-        for (int i = 1; i < mpi_size; ++i) {
-            char uuid[16] {};
-            MPI_Recv(uuid, 16, MPI_CHAR, i, 0, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-            gpus.insert(uuidstr(uuid));
+    if (quantumerrors == 4)
+        if (mpi_x) {
+            if (mpi_xrank != 0)
+                randomN.resize(repeat*t*(t-1)/2);
+            MPI_Bcast(&randomN[0], randomN.size(), MPI_DOUBLE, 0, mpi_xcomm);
         }
-    }
 
     // print status information
     if (mpi_rank == 0) {
@@ -214,7 +294,7 @@ int main(int argc,
         int driverversion, runtimeversion;
         cudaDriverGetVersion(&driverversion);
         cudaRuntimeGetVersion(&runtimeversion);
-        std::cout << "[INFO] Total number of GPUs used: " << gpus.size() << std::endl;
+        std::cout << "[INFO] Total number of GPUs used: " << num_gpus << std::endl;
         std::cout << "[INFO] CUDA device " << cudadev << ": " << deviceprop.name << " (UUID: " << uuidstr(deviceprop.uuid.bytes) << ")" << std::endl;
         std::cout << "[INFO] CUDA device " << cudadev << " version (driver / runtime / capability): "
             << driverversion/1000 << '.' << (driverversion%100)/10 << " / "
@@ -225,6 +305,7 @@ int main(int argc,
             << deviceprop.clockRate*1e-6 << " GHz / "
             << deviceprop.multiProcessorCount << " / "
             << deviceprop.maxThreadsPerMultiProcessor << std::endl;
+        std::cout << "[INFO] OpenACC local devices with type " << acc_device_nvidia << " (nvidia): " << num_nvidia_devices << std::endl;
         std::cout << "[INFO] OpenACC device type: " << acc_get_device_type() << std::endl;
         std::cout << "[INFO] OpenACC device used: " << acc_get_device_num(acc_get_device_type()) << std::endl;
         char mpi_processor[MPI_MAX_PROCESSOR_NAME] = {};
@@ -232,17 +313,32 @@ int main(int argc,
         MPI_Get_processor_name(mpi_processor, &mpi_processor_len);
         std::cout << "[INFO] MPI root processor: " << mpi_processor << std::endl;
         std::cout << "[INFO] MPI number of processes: " << mpi_size << std::endl;
-        if (mpi_size != gpus.size())
-            std::cout << "[WARN] Number of GPUs is not equal to the number of MPI processes, probably using over- or undersubscription" << std::endl;
+        std::cout << "[INFO] NCCL version code: " << nccl_version << std::endl;
+        std::cout << "[INFO] CPU number of root process: " << sched_getcpu() << std::endl;
+        std::cout << "[INFO] CPU affinity: ";
+        cpu_set_t cpu_mask;
+        sched_getaffinity(0, sizeof(cpu_set_t), &cpu_mask);
+        int cpu_count = CPU_COUNT(&cpu_mask);
+        int num_cpus = std::thread::hardware_concurrency();
+        for (int i = num_cpus-1; i >= 0; --i)
+            std::cout << CPU_ISSET(i, &cpu_mask) << (i > 0 && i%8 == 0 ? " " : "");
+        std::cout << std::endl;
+        if (communication == communication_nccl && cpu_count == 1)  // would be even better to increase affinity ourselves here, where could that go wrong?
+            std::cout << "[WARN] NCCL may be much slower than expected because with only one CPU in the affinity mask there may not be enough CPU resources for the NCCL proxy thread! Allocate more cpus per task e.g. by cpu-binding to sockets to remedy that." << std::endl;
+        if (mpi_size != num_gpus)
+            std::cout << "[WARN] Number of all GPUs is not equal to the number of MPI processes, probably using over- or undersubscription" << std::endl;
+        if (num_nvidia_devices > mpi_local_size)
+            std::cout << "[WARN] Number of intra-node GPUs is larger than the number of local MPI processes (" << mpi_local_size << "), probably using undersubscription" << std::endl;
         std::cout << "[INFO] Simulating Shor's algorithm with sc-FT on GPUs for N=" << N << " a=" << a << " t=" << t
                   << " [repeat=" << repeat << "] [seed=" << seed <<  "] [errorseed=" << errorseed << "] [append=" << append << "]"
                   << " [cpprandom=" << cpprandom << "] [saverandom=" << saverandom << "] [buffercount=" << buffercount << "]"
-                  << " [delta=" << delta << "] [quantumerrors=" << quantumerrors << "] [bandwidth=" << bandwidth << "] [outfile=" << outfile << "]" << std::endl;
+                  << " [delta=" << delta << "] [quantumerrors=" << quantumerrors << "] [bandwidth=" << bandwidth << "] [outfile=" << outfile << "]"
+                  << " [communication=" << print_communication(communication) << "]" << std::endl;
         std::cout << "[INFO] Allocating memory for psi and psibuf per GPU: 2*" << num_local*sizeof(cuDoubleComplex) << " B" << std::endl;
         std::cout << "[INFO] Number of global + local qubits: " << global_qubits << " + " << local_qubits << " = " << num_qubits << std::endl;
     }
 
-    // allocate memory for each process: global qubits = MPI rank (29 local qubits: 2*16*2^29 B + 2*4*2^29 B = (16 + 4) GiB = 20 GiB per GPU => maximum on 2048=2^11 A100 GPUs: 40 qubits (so 40 TiB in total))
+    // allocate memory for each process: global qubits = MPI rank (29 local qubits: (2*16 + 2*4)*2^29 B = (16 + 4) GiB = 20 GiB per GPU => maximum on 2048=2^11 A100 GPUs: 40 qubits (so 40 TiB in total))
     cuDoubleComplex* psibuf = nullptr;
     int* oracle_idxsend = nullptr;
     int* oracle_idxrecv = nullptr;
@@ -376,42 +472,63 @@ int main(int argc,
                 }
                 time_it(time_oraclearrange);
 
-                // MPI transfer psi from this GPU -> psibuf from other GPUs (post recvs first, and take care of well-ordered sends; this version was faster than MPI_Alltoallv)
-#ifdef ALLTOALL
-                #pragma acc host_data use_device(psi)
-//                MPI_Alltoallv(psi, oracle_countsend, oracle_offsetsend, MPI_C_DOUBLE_COMPLEX,
-//                              psibuf, oracle_countrecv, oracle_offsetrecv, MPI_C_DOUBLE_COMPLEX,
-//                              mpi_xcomm);
-                twophase_rbruck_alltoallv(r, (char*)psi, oracle_countsend, oracle_offsetsend, MPI_C_DOUBLE_COMPLEX,
-                		(char*)psibuf, oracle_countrecv, oracle_offsetrecv, MPI_C_DOUBLE_COMPLEX,
-                        mpi_xcomm);
-//                MPI_Alltoallv(oracle_idxsend, oracle_countsend, oracle_offsetsend, MPI_INT,
-//                              oracle_idxrecv, oracle_countrecv, oracle_offsetrecv, MPI_INT,
-//                              mpi_xcomm);
-                twophase_rbruck_alltoallv(r, (char*)oracle_idxsend, oracle_countsend, oracle_offsetsend, MPI_INT,
-                		(char*)oracle_idxrecv, oracle_countrecv, oracle_offsetrecv, MPI_INT,
-                        mpi_xcomm);
-#else
-                int num_requests = 0;
-                for (int delta_xrank = 0; delta_xrank < mpi_xsize; ++delta_xrank) {
-                    int recv_xrank = (mpi_xrank + delta_xrank) % mpi_xsize;
-                    for (int sent = 0; sent < oracle_countrecv[recv_xrank]; sent += min<int>(oracle_countrecv[recv_xrank]-sent,buffercount)) {
-                        MPI_Irecv(psibuf         + oracle_offsetrecv[recv_xrank] + sent, min<int>(oracle_countrecv[recv_xrank]-sent,buffercount), MPI_C_DOUBLE_COMPLEX, recv_xrank, 2*(sent / buffercount),   mpi_xcomm, &mpi_requests[num_requests++]);
-                        MPI_Irecv(oracle_idxrecv + oracle_offsetrecv[recv_xrank] + sent, min<int>(oracle_countrecv[recv_xrank]-sent,buffercount), MPI_INT,              recv_xrank, 2*(sent / buffercount)+1, mpi_xcomm, &mpi_requests[num_requests++]);
-                    }
-                    int send_xrank = (mpi_xrank - delta_xrank + mpi_xsize) % mpi_xsize;
-                    for (int sent = 0; sent < oracle_countsend[send_xrank]; sent += min<int>(oracle_countsend[send_xrank]-sent,buffercount)) {
+                // implementation of the oracle (transfer all relevant coefficients of psi from this GPU to psibuf from the other GPUs)
+                if (communication == communication_nccl) {
+                    ncclGroupStart();
+                    for (int other_xrank = 0; other_xrank < mpi_xsize; ++other_xrank) {
                         #pragma acc host_data use_device(psi)
-                        MPI_Isend(psi            + oracle_offsetsend[send_xrank] + sent, min<int>(oracle_countsend[send_xrank]-sent,buffercount), MPI_C_DOUBLE_COMPLEX, send_xrank, 2*(sent / buffercount),   mpi_xcomm, &mpi_requests[num_requests++]);
-                        MPI_Isend(oracle_idxsend + oracle_offsetsend[send_xrank] + sent, min<int>(oracle_countsend[send_xrank]-sent,buffercount), MPI_INT,              send_xrank, 2*(sent / buffercount)+1, mpi_xcomm, &mpi_requests[num_requests++]);
+                        ncclSend(psi            + oracle_offsetsend[other_xrank], 2*oracle_countsend[other_xrank], ncclDouble, other_xrank, nccl_xcomm, cuda_stream);
+                        ncclSend(oracle_idxsend + oracle_offsetsend[other_xrank], oracle_countsend[other_xrank],   ncclInt,    other_xrank, nccl_xcomm, cuda_stream);
+                        ncclRecv(psibuf         + oracle_offsetrecv[other_xrank], 2*oracle_countrecv[other_xrank], ncclDouble, other_xrank, nccl_xcomm, cuda_stream);
+                        ncclRecv(oracle_idxrecv + oracle_offsetrecv[other_xrank], oracle_countrecv[other_xrank],   ncclInt,    other_xrank, nccl_xcomm, cuda_stream);
                     }
+                    ncclGroupEnd();
+                    cudaStreamSynchronize(cuda_stream);
+                } else if (communication == communication_irecvisend) {
+                    int num_requests = 0;
+                    for (int delta_xrank = 0; delta_xrank < mpi_xsize; ++delta_xrank) {
+                        int recv_xrank = (mpi_xrank + delta_xrank) % mpi_xsize;
+                        for (int sent = 0; sent < oracle_countrecv[recv_xrank]; sent += min<int>(oracle_countrecv[recv_xrank]-sent,buffercount)) {
+                            MPI_Irecv(psibuf         + oracle_offsetrecv[recv_xrank] + sent, min<int>(oracle_countrecv[recv_xrank]-sent,buffercount), MPI_C_DOUBLE_COMPLEX, recv_xrank, 2*(sent / buffercount),   mpi_xcomm, &mpi_requests[num_requests++]);
+                            MPI_Irecv(oracle_idxrecv + oracle_offsetrecv[recv_xrank] + sent, min<int>(oracle_countrecv[recv_xrank]-sent,buffercount), MPI_INT,              recv_xrank, 2*(sent / buffercount)+1, mpi_xcomm, &mpi_requests[num_requests++]);
+                        }
+                        int send_xrank = (mpi_xrank - delta_xrank + mpi_xsize) % mpi_xsize;
+                        for (int sent = 0; sent < oracle_countsend[send_xrank]; sent += min<int>(oracle_countsend[send_xrank]-sent,buffercount)) {
+                            #pragma acc host_data use_device(psi)
+                            MPI_Isend(psi            + oracle_offsetsend[send_xrank] + sent, min<int>(oracle_countsend[send_xrank]-sent,buffercount), MPI_C_DOUBLE_COMPLEX, send_xrank, 2*(sent / buffercount),   mpi_xcomm, &mpi_requests[num_requests++]);
+                            MPI_Isend(oracle_idxsend + oracle_offsetsend[send_xrank] + sent, min<int>(oracle_countsend[send_xrank]-sent,buffercount), MPI_INT,              send_xrank, 2*(sent / buffercount)+1, mpi_xcomm, &mpi_requests[num_requests++]);
+                        }
+                    }
+                    MPI_Waitall(num_requests, mpi_requests, MPI_STATUS_IGNORE);
+                } else if (communication == communication_alltoall) {
+                    #pragma acc host_data use_device(psi)
+                    MPI_Alltoallv(psi, oracle_countsend, oracle_offsetsend, MPI_C_DOUBLE_COMPLEX,
+                                  psibuf, oracle_countrecv, oracle_offsetrecv, MPI_C_DOUBLE_COMPLEX,
+                                  mpi_xcomm);
+                    MPI_Alltoallv(oracle_idxsend, oracle_countsend, oracle_offsetsend, MPI_INT,
+                                  oracle_idxrecv, oracle_countrecv, oracle_offsetrecv, MPI_INT,
+                                  mpi_xcomm);
                 }
-                MPI_Waitall(num_requests, mpi_requests, MPI_STATUS_IGNORE);
-#endif
                 time_it(time_oraclempi);
 
                 // copy and rearrange psibuf -> psi (63.11) and implement the R gates while doing that
-                double phi = pi*(std::ldexp(jhi&bmaskhi,-cbit+64) + std::ldexp(jlo&bmasklo,-cbit));  // pi*j / 2^cbit = pi*(jhi * 2^64 + jlo) / 2^cbit = pi * 0.jcbit-1...j0 (63.10); banded QFT: take only the <bandwidth> most-significant bits
+                double phi = 0;
+                if (quantumerrors == 4) {  // (63.26); in the unbanded version, this corresponds to Thm.1 / Thm.3 from Cai2023 (the banded version does not directly correspond to Thm.2 in Cai2023)
+                    for (int l = 0; l < cbit; ++l) {
+                        double rN = randomN[rNidx++];
+                        if (l < 64) {
+                            if (jlo & bmasklo & (1ULL << l))
+                                phi += 1 + delta*rN;
+                        } else {
+                            if (jhi & bmaskhi & (1ULL << (l-64)))
+                                phi += 1 + delta*rN;
+                        }
+                        phi *= 0.5;
+                    }
+                    phi *= pi;
+                } else {
+                    phi = pi*(std::ldexp(jhi&bmaskhi,-cbit+64) + std::ldexp(jlo&bmasklo,-cbit));  // pi*j / 2^cbit = pi*(jhi * 2^64 + jlo) / 2^cbit = pi * 0.jcbit-1...j0 (63.10); banded QFT: take only the <bandwidth> most-significant bits
+                }
                 double c = std::cos(phi);
                 double s = std::sin(phi);
                 #pragma acc parallel loop independent present(psi[0:num_local]) deviceptr(psibuf,oracle_idxrecv)
@@ -428,11 +545,20 @@ int main(int argc,
                 dump_psi(false, ">>>ORACLE<<< cbit="+std::to_string(cbit));
 
             // implementation of the H gate
-            for (uint64_t sent = 0; sent < num_local; sent += min(num_local-sent,buffercount)) {
+            if (communication == communication_nccl) {
+                ncclGroupStart();
                 #pragma acc host_data use_device(psi)
-                MPI_Sendrecv(psi + sent,    min(num_local-sent,buffercount), MPI_C_DOUBLE_COMPLEX, mpi_rank ^ mpi_xsize, sent / buffercount,
-                             psibuf + sent, min(num_local-sent,buffercount), MPI_C_DOUBLE_COMPLEX, mpi_rank ^ mpi_xsize, sent / buffercount,
-                             MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                ncclSend(psi,    2*num_local, ncclDouble, mpi_rank ^ mpi_xsize, nccl_comm, cuda_stream);
+                ncclRecv(psibuf, 2*num_local, ncclDouble, mpi_rank ^ mpi_xsize, nccl_comm, cuda_stream);
+                ncclGroupEnd();
+                cudaStreamSynchronize(cuda_stream);
+            } else {
+                for (uint64_t sent = 0; sent < num_local; sent += min(num_local-sent,buffercount)) {
+                    #pragma acc host_data use_device(psi)
+                    MPI_Sendrecv(psi + sent,    min(num_local-sent,buffercount), MPI_C_DOUBLE_COMPLEX, mpi_rank ^ mpi_xsize, sent / buffercount,
+                                 psibuf + sent, min(num_local-sent,buffercount), MPI_C_DOUBLE_COMPLEX, mpi_rank ^ mpi_xsize, sent / buffercount,
+                                 MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                }
             }
             time_it(time_hadamardmpi);
             if (mpi_x) {
@@ -521,7 +647,7 @@ int main(int argc,
                 dump_psi(false, ">>>MEASUREMENT<<< cbit="+std::to_string(cbit));
             time_it(time_measurement);
 
-            // all mpi_x = jcbit copy all their amplitudes with MPI_set to all mpi_x = 1-jcbit, divide by sqrt(2*prob) for normalization
+            // implementation of the reset operation (all mpi_x = jcbit ranks copy all their amplitudes to all mpi_x = 1-jcbit ranks, divide by sqrt(2*prob) for normalization)
             if (mpi_x == jcbit) {
                 double norm = 1./std::sqrt(2*prob);
                 #pragma acc parallel loop independent present(psi[0:num_local])
@@ -529,15 +655,29 @@ int main(int argc,
                     psi[i].x *= norm;
                     psi[i].y *= norm;
                 }
-                for (uint64_t sent = 0; sent < num_local; sent += min(num_local-sent,buffercount)) {
+            }
+            if (communication == communication_nccl) {
+                ncclGroupStart();
+                if (mpi_x == jcbit) {
                     #pragma acc host_data use_device(psi)
-                    MPI_Send(psi + sent, min(num_local-sent,buffercount), MPI_C_DOUBLE_COMPLEX, mpi_rank ^ mpi_xsize, sent / buffercount, MPI_COMM_WORLD);
+                    ncclSend(psi, 2*num_local, ncclDouble, mpi_rank ^ mpi_xsize, nccl_comm, cuda_stream);
+                } else {
+                    #pragma acc host_data use_device(psi)
+                    ncclRecv(psi, 2*num_local, ncclDouble, mpi_rank ^ mpi_xsize, nccl_comm, cuda_stream);
                 }
+                ncclGroupEnd();
+                cudaStreamSynchronize(cuda_stream);
             } else {
-                for (uint64_t sent = 0; sent < num_local; sent += min(num_local-sent,buffercount)) {
-                    #pragma acc host_data use_device(psi)
-                    MPI_Recv(psi + sent, min(num_local-sent,buffercount), MPI_C_DOUBLE_COMPLEX, mpi_rank ^ mpi_xsize, sent / buffercount, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
-                }
+                if (mpi_x == jcbit)
+                    for (uint64_t sent = 0; sent < num_local; sent += min(num_local-sent,buffercount)) {
+                        #pragma acc host_data use_device(psi)
+                        MPI_Send(psi + sent, min(num_local-sent,buffercount), MPI_C_DOUBLE_COMPLEX, mpi_rank ^ mpi_xsize, sent / buffercount, MPI_COMM_WORLD);
+                    }
+                else
+                    for (uint64_t sent = 0; sent < num_local; sent += min(num_local-sent,buffercount)) {
+                        #pragma acc host_data use_device(psi)
+                        MPI_Recv(psi + sent, min(num_local-sent,buffercount), MPI_C_DOUBLE_COMPLEX, mpi_rank ^ mpi_xsize, sent / buffercount, MPI_COMM_WORLD, MPI_STATUS_IGNORE);
+                    }
             }
             if (quantumerrors == 2) {  // if necessary, renormalize the amplitudes to initialize the respective quantumerrors case (63.19); here, amplitude mass is shifted from |1>|...> to |0>|...>
                 double renormalize = (mpi_x == 0 ? std::sqrt(1 + delta) : std::sqrt(1 - delta));
@@ -563,7 +703,7 @@ int main(int argc,
             time_it(time_reset);
         }
 
-        // output measured classical bitstring to file, and after 10 repetitions or at the end, accumulate and print timing data; also, check norm
+        // output measured classical bitstring to file, and after 10 repetitions or at the end, accumulate and print timing data; also, check norm and usage of random numbers
         double norm = compute_norm();
         if (mpi_rank == 0) {
             out << (std::bitset<64>(jhi).to_string() + std::bitset<64>(jlo).to_string()).substr(128-t)
@@ -588,6 +728,8 @@ int main(int argc,
         }
         time_it(time_output);
     }
+    if (rNidx != randomN.size())
+        std::cout << "[WARN] Rank " << mpi_rank << " used " << rNidx << " != " << randomN.size() << " random numbers" << std::endl;
 
     // print total elapsed time
     if (mpi_rank == 0)
@@ -605,6 +747,9 @@ int main(int argc,
     if (oracle_idxsend) cudaFree(oracle_idxsend);
     if (psibuf) cudaFree(psibuf);
     if (psi) delete[] psi;
+    cudaStreamDestroy(cuda_stream);
+    if (nccl_xcomm) ncclCommDestroy(nccl_xcomm);
+    if (nccl_comm) ncclCommDestroy(nccl_comm);
     if (mpi_xcomm) MPI_Comm_free(&mpi_xcomm);
     MPI_Finalize();
     return 0;
@@ -617,6 +762,22 @@ std::string uuidstr(const char uuid[16]) {
         ostr << std::setw(2) << (0xff & uuid[i])
              << (i == 3 || i == 5 || i == 7 || i == 9 ? "-" : "");
     return ostr.str();
+}
+
+communication_type parse_communication(std::string argument) {
+    if (argument == "irecvisend")    return communication_irecvisend;
+    else if (argument == "alltoall") return communication_alltoall;
+    else if (argument == "nccl")     return communication_nccl;
+    else error("communication type '"+argument+"' is unknown; exiting", true);
+    return communication_type{};
+}
+
+std::string print_communication(communication_type communication) {
+    if (communication == communication_irecvisend)    return "irecvisend";
+    else if (communication == communication_alltoall) return "alltoall";
+    else if (communication == communication_nccl)     return "nccl";
+    else error("communication type '"+std::to_string(communication)+"' is unknown; exiting", true);
+    return "";
 }
 
 int error(std::string message, bool onlyrank0) {
@@ -647,8 +808,7 @@ inline uint64_t modular_inverse(uint64_t a,
 inline uint64_t modular_multiply(uint64_t a,
                                  uint64_t b,
                                  uint64_t N) {
-    // first try the multiplication and check for overflow; only if necessary, do the slower overflow-free multiplication
-    // NOTE: since NVHPC 21.7, __int128 is supported, so in the future we might not need to emulate it ourselves here
+#ifdef EMULATE_INT128
     a %= N;
     b %= N;
     uint64_t res = a*b;
@@ -667,6 +827,14 @@ inline uint64_t modular_multiply(uint64_t a,
         b >>= 1;
     }
     return res;
+#else
+    // since NVHPC 21.7, __int128 is supported (but according to the 24.3 reference manual "128-bit integer support is not supported with OpenMP, OpenACC and CUDA")
+    using uint128_t = unsigned __int128;
+    uint128_t res = a;
+    res *= b;
+    res %= N;
+    return static_cast<uint64_t>(res);
+#endif
 }
 
 double compute_norm() {
@@ -701,128 +869,4 @@ void dump_psi(bool includezeros, const std::string title) {
         }
     }
     MPI_Barrier(MPI_COMM_WORLD);
-}
-
-
-int myPow(int x, unsigned int p) {
-  if (p == 0) return 1;
-  if (p == 1) return x;
-
-  int tmp = myPow(x, p/2);
-  if (p%2 == 0) return tmp * tmp;
-  else return x * tmp * tmp;
-}
-
-
-int twophase_rbruck_alltoallv(int r, char *sendbuf, int *sendcounts, int *sdispls, MPI_Datatype sendtype,
-		char *recvbuf, int *recvcounts, int *rdispls, MPI_Datatype recvtype, MPI_Comm comm){
-
-	if ( r < 2 ) { return -1; }
-
-	int rank, nprocs, typesize;
-	MPI_Comm_rank(comm, &rank);
-	MPI_Comm_size(comm, &nprocs);
-
-	if ( r > nprocs ) { r = nprocs; }
-
-	int w, nlpow, d;
-	int local_max_count=0, max_send_count=0;
-	int sendNcopy[nprocs], rotate_index_array[nprocs], pos_status[nprocs];
-
-	MPI_Type_size(sendtype, &typesize);
-
-	w = ceil(log(nprocs) / log(r)); // calculate the number of digits when using r-representation
-	nlpow = myPow(r, w-1); // maximum send number of elements
-	d = (myPow(r, w) - nprocs) / nlpow; // calculate the number of highest digits
-
-	// 1. Find max send count
-	for (int i = 0; i < nprocs; i++) {
-		if (sendcounts[i] > local_max_count)
-			local_max_count = sendcounts[i];
-	}
-	MPI_Allreduce(&local_max_count, &max_send_count, 1, MPI_INT, MPI_MAX, comm);
-	memcpy(sendNcopy, sendcounts, nprocs*sizeof(int));
-
-
-    // 2. create local index array after rotation
-	for (int i = 0; i < nprocs; i++)
-		rotate_index_array[i] = (2*rank-i+nprocs)%nprocs;
-
-	// 3. exchange data with log(P) steps
-	char* extra_buffer = (char*) malloc(max_send_count*typesize*nprocs);
-	char* temp_send_buffer = (char*) malloc(max_send_count*typesize*nlpow);
-	char* temp_recv_buffer = (char*) malloc(max_send_count*typesize*nlpow);
-	memset(pos_status, 0, nprocs*sizeof(int));
-
-	int sent_blocks[nlpow];
-	int di = 0, spoint = 1, distance = myPow(r, w-1), next_distance = distance*r;
-
-	for (int x = w-1; x > -1; x--) {
-		int ze = (x == w - 1)? r - d: r;
-		for (int z = ze-1; z > 0; z--) {
-
-			// 1) get the sent data-blocks
-			di = 0;
-			spoint = z * distance;
-			for (int i = spoint; i < nprocs; i += next_distance) {
-				for (int j = i; j < (i+distance); j++) {
-					if (j > nprocs - 1 ) { break; }
-					int id = (j + rank) % nprocs;
-					sent_blocks[di++] = id;
-				}
-			}
-
-			// 2) prepare metadata and send buffer
-			int metadata_send[di];
-			int sendCount = 0, offset = 0;
-			for (int i = 0; i < di; i++) {
-				int send_index = rotate_index_array[sent_blocks[i]];
-				metadata_send[i] = sendNcopy[send_index];
-				if (pos_status[send_index] == 0)
-					memcpy(&temp_send_buffer[offset], &sendbuf[sdispls[send_index]*typesize], sendNcopy[send_index]*typesize);
-				else
-					memcpy(&temp_send_buffer[offset], &extra_buffer[sent_blocks[i]*max_send_count*typesize], sendNcopy[send_index]*typesize);
-				offset += sendNcopy[send_index]*typesize;
-			}
-
-			// 3) exchange metadata
-			int recvrank = (rank + spoint) % nprocs; // receive data from rank - 2^step process
-			int sendrank = (rank - spoint + nprocs) % nprocs; // send data from rank + 2^k process
-
-			int metadata_recv[di];
-			MPI_Sendrecv(metadata_send, di, MPI_INT, sendrank, 0, metadata_recv, di, MPI_INT, recvrank, 0, comm, MPI_STATUS_IGNORE);
-
-			for(int i = 0; i < di; i++)
-				sendCount += metadata_recv[i];
-
-			// 4) exchange data
-			MPI_Sendrecv(temp_send_buffer, offset, MPI_CHAR, sendrank, 1, temp_recv_buffer, sendCount*typesize, MPI_CHAR, recvrank, 1, comm, MPI_STATUS_IGNORE);
-
-			// 5) replaces
-			offset = 0;
-			for (int i = 0; i < di; i++) {
-				int send_index = rotate_index_array[sent_blocks[i]];
-
-				int origin_index = (sent_blocks[i] - rank + nprocs) % nprocs;
-				if (origin_index % next_distance == (recvrank - rank + nprocs) % nprocs)
-					memcpy(&recvbuf[rdispls[sent_blocks[i]]*typesize], &temp_recv_buffer[offset], metadata_recv[i]*typesize);
-				else
-					memcpy(&extra_buffer[sent_blocks[i]*max_send_count*typesize], &temp_recv_buffer[offset], metadata_recv[i]*typesize);
-
-				offset += metadata_recv[i]*typesize;
-				pos_status[send_index] = 1;
-				sendNcopy[send_index] = metadata_recv[i];
-			}
-		}
-		distance /= r;
-		next_distance /= r;
-	}
-
-	memcpy(&recvbuf[rdispls[rank]*typesize], &sendbuf[sdispls[rank]*typesize], recvcounts[rank]*typesize);
-
-	free(temp_send_buffer);
-	free(temp_recv_buffer);
-	free(extra_buffer);
-
-	return 0;
 }
